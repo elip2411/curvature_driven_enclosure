@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html dir="ltr">
+<head>
+<meta charset="utf-8">
+<style>
+  html, body { margin: 0; padding: 0; background: transparent; direction: ltr;
+               font-family: "Source Sans Pro", "Source Sans 3", "Segoe UI", Arial, sans-serif; color: #31333F; }
+  #wrap { padding: 2px 10px 4px 2px; }
+  #label { font-size: 14px; display: flex; justify-content: space-between; align-items: flex-start; gap: 6px; }
+  #help { flex: none; width: 15px; height: 15px; border-radius: 50%; border: 1px solid #9aa3ad; color: #6b7480;
+          font-size: 11px; line-height: 15px; text-align: center; cursor: help; }
+  #track { position: relative; margin-top: 22px; height: 22px; }
+  #bubble { position: absolute; top: -20px; transform: translateX(-50%); font-size: 13px; font-weight: 600;
+            color: #1B2A41; white-space: nowrap; pointer-events: none; }
+  input[type=range] { -webkit-appearance: none; appearance: none; width: 100%; margin: 0; height: 22px;
+                      background: transparent; cursor: pointer; direction: ltr; }
+  input[type=range]:focus { outline: none; }
+  input[type=range]::-webkit-slider-runnable-track { height: 4px; border-radius: 2px; background: #d3d8df; }
+  input[type=range]::-moz-range-track { height: 4px; border-radius: 2px; background: #d3d8df; }
+  input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 16px; height: 16px; margin-top: -6px;
+                      border-radius: 50%; background: #1F5FAD; border: 2px solid white; box-shadow: 0 0 0 1px #1F5FAD; }
+  input[type=range]::-moz-range-thumb { width: 14px; height: 14px; border-radius: 50%; background: #1F5FAD;
+                      border: 2px solid white; box-shadow: 0 0 0 1px #1F5FAD; }
+  input[type=range]:focus::-webkit-slider-thumb { box-shadow: 0 0 0 4px rgba(31, 95, 173, 0.25); }
+  #ends { display: flex; justify-content: space-between; font-size: 12px; color: #808892; margin-top: -2px; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="label"><span id="ltext"></span><span id="help" title="">?</span></div>
+  <div id="track"><div id="bubble"></div><input id="rng" type="range" min="0" max="1000" step="1"></div>
+  <div id="ends"><span id="lo"></span><span id="hi"></span></div>
+</div>
+<script>
+function send(type, data) { window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type: type }, data || {}), "*"); }
+const rng = document.getElementById("rng"), bubble = document.getElementById("bubble");
+let A = null, dragging = false, lastSent = null;
+let N = 1000;                                     // positions: one per step (linear) or 1000 (log)
+
+function fmt(v) {
+  if (A.log && v >= 1000) return Math.round(v).toLocaleString("en-US");
+  return Number(v).toFixed(A.decimals);
+}
+function snap(v) {                                // to the step (linear) or 2 significant digits (log)
+  if (A.log) {
+    const p = Math.pow(10, Math.floor(Math.log10(v)) - 1);
+    v = Math.round(v / p) * p;
+  } else {
+    v = A.min + Math.round((v - A.min) / A.step) * A.step;
+  }
+  return Math.min(A.max, Math.max(A.min, Number(v.toFixed(10))));
+}
+function toVal(pos) {
+  const t = pos / N;
+  return snap(A.log ? A.min * Math.pow(A.max / A.min, t) : A.min + t * (A.max - A.min));
+}
+function toPos(v) {
+  const t = A.log ? Math.log(v / A.min) / Math.log(A.max / A.min) : (v - A.min) / (A.max - A.min);
+  return Math.round(Math.min(1, Math.max(0, t)) * N);
+}
+function showBubble() {
+  const v = toVal(+rng.value), t = +rng.value / N;
+  bubble.textContent = fmt(v);
+  const w = rng.clientWidth, thumb = 16;      // keep the label centred over the thumb
+  bubble.style.left = (thumb / 2 + t * (w - thumb)) + "px";
+  return v;
+}
+function commit() {
+  const v = showBubble();
+  if (v !== lastSent) { lastSent = v; send("streamlit:setComponentValue", { value: v, dataType: "json" }); }
+}
+rng.addEventListener("input", () => { dragging = true; showBubble(); });
+rng.addEventListener("change", () => { dragging = false; commit(); });
+window.addEventListener("resize", showBubble);
+
+window.addEventListener("message", ev => {
+  const d = ev.data;
+  if (!d || d.type !== "streamlit:render") return;
+  A = d.args;
+  N = A.log ? 1000 : Math.max(1, Math.round((A.max - A.min) / A.step));
+  rng.max = N;
+  document.getElementById("ltext").textContent = A.label;
+  const h = document.getElementById("help");
+  h.style.display = A.help ? "inline-block" : "none"; h.title = A.help || "";
+  document.getElementById("lo").textContent = fmt(A.min);
+  document.getElementById("hi").textContent = fmt(A.max);
+  if (!dragging) {
+    const cur = (A.current === null || A.current === undefined) ? A.value : A.current;
+    rng.value = toPos(cur); lastSent = cur;
+  }
+  showBubble();
+  send("streamlit:setFrameHeight", { height: document.body.scrollHeight + 2 });
+});
+send("streamlit:componentReady", { apiVersion: 1 });
+</script>
+</body>
+</html>

@@ -1,0 +1,403 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  html, body { margin: 0; padding: 0; font-family: "Source Sans Pro", "Segoe UI", Arial, sans-serif;
+               color: #1B2A41; background: transparent; }
+  #wrap { display: inline-block; }
+  canvas { display: block; background: #ffffff; border: 1px solid #d5dbe3; border-radius: 6px; }
+  #cv { cursor: crosshair; }
+  .bar { display: flex; gap: 8px; align-items: center; margin-top: 8px; flex-wrap: wrap; }
+  button { font: inherit; font-size: 14px; padding: 5px 12px; border-radius: 6px; cursor: pointer;
+           border: 1px solid #c3cbd6; background: #f6f8fb; color: #1B2A41; }
+  button.primary { background: #1F5FAD; border-color: #1F5FAD; color: white; }
+  button:disabled { opacity: 0.45; cursor: default; }
+  #msg { font-size: 14px; min-height: 20px; margin-top: 6px; }
+  .err { color: #C8102E; } .ok { color: #2E8B57; } .muted { color: #5F6B7A; }
+  input[type=range] { flex: 1; min-width: 160px; }
+  select { font: inherit; font-size: 14px; padding: 3px; border-radius: 6px; }
+  label { font-size: 14px; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="cv"></canvas>
+  <div id="drawbar" class="bar">
+    <button id="bclose" class="primary">Close polygon</button>
+    <button id="bundo">Undo</button>
+    <button id="bclear">Clear</button>
+    <span id="count" class="muted"></span>
+  </div>
+  <div id="simbar" class="bar">
+    <button id="bplay" class="primary">Pause</button>
+    <input id="slider" type="range" min="0" max="0" value="0">
+    <label>speed <select id="speed">
+      <option value="0.25">0.25x</option><option value="0.5">0.5x</option>
+      <option value="1" selected>1x</option><option value="2">2x</option><option value="4">4x</option>
+    </select></label>
+    <label><input id="loop" type="checkbox"> loop</label>
+  </div>
+  <canvas id="charts"></canvas>
+  <div id="msg"></div>
+</div>
+<script>
+// ---------------------------------------------------------------- Streamlit protocol
+function send(type, data) {
+  window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type: type }, data || {}), "*");
+}
+function setValue(v) { send("streamlit:setComponentValue", { value: v, dataType: "json" }); }
+function setHeight() { send("streamlit:setFrameHeight", { height: document.body.scrollHeight + 4 }); }
+
+// ---------------------------------------------------------------- geometry (simplicity)
+const EPS = 1e-9;
+function orient(a, b, c) { return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]); }
+function onSeg(a, b, p) {
+  const abx = b[0] - a[0], aby = b[1] - a[1], apx = p[0] - a[0], apy = p[1] - a[1];
+  const L2 = abx * abx + aby * aby;
+  if (L2 === 0) return Math.hypot(apx, apy) <= EPS;
+  const t = (apx * abx + apy * aby) / L2;
+  if (t < -1e-12 || t > 1 + 1e-12) return false;
+  return Math.abs(orient(a, b, p)) / Math.sqrt(L2) <= EPS;
+}
+function segTouch(a, b, c, d) {
+  const o1 = orient(a, b, c), o2 = orient(a, b, d), o3 = orient(c, d, a), o4 = orient(c, d, b);
+  if (((o1 > EPS && o2 < -EPS) || (o1 < -EPS && o2 > EPS)) &&
+      ((o3 > EPS && o4 < -EPS) || (o3 < -EPS && o4 > EPS))) return true;
+  return onSeg(a, b, c) || onSeg(a, b, d) || onSeg(c, d, a) || onSeg(c, d, b);
+}
+function adjacentOk(a, b, c) {   // edges ab, bc must not fold back onto each other
+  const col = Math.abs(orient(a, b, c)) <= EPS * Math.max(1, Math.hypot(c[0] - a[0], c[1] - a[1]));
+  const dot = (a[0] - b[0]) * (c[0] - b[0]) + (a[1] - b[1]) * (c[1] - b[1]);
+  return !(col && dot > 0);
+}
+function same(p, q) { return Math.hypot(p[0] - q[0], p[1] - q[1]) < 1e-9; }
+function canAdd(pts, p) {
+  const n = pts.length;
+  if (n && same(p, pts[n - 1])) return [false, "same point as the previous vertex"];
+  for (const q of pts) if (same(p, q)) return [false, "this point is already a vertex"];
+  if (n === 0) return [true, ""];
+  const a = pts[n - 1], b = p;
+  for (let i = 0; i < n - 1; i++) {
+    const c = pts[i], d = pts[i + 1];
+    if (i === n - 2) { if (!adjacentOk(c, d, b)) return [false, "the edge folds back onto the previous edge"]; continue; }
+    if (segTouch(a, b, c, d)) return [false, "the edge would cross or touch edge " + (i + 1)];
+  }
+  return [true, ""];
+}
+function isSimple(P) {
+  const n = P.length;
+  if (n < 3) return [false, "at least 3 vertices are needed"];
+  let area = 0;
+  for (let i = 0; i < n; i++) area += P[i][0] * P[(i + 1) % n][1] - P[(i + 1) % n][0] * P[i][1];
+  if (Math.abs(area) < 1e-6) return [false, "the polygon has zero area"];
+  for (let i = 0; i < n; i++) {
+    const a = P[i], b = P[(i + 1) % n];
+    if (!adjacentOk(P[(i - 1 + n) % n], a, b)) return [false, "edges at vertex " + (i + 1) + " fold back"];
+    for (let j = i + 1; j < n; j++) {
+      if ((j + 1) % n === i || (i + 1) % n === j) continue;
+      if (segTouch(a, b, P[j], P[(j + 1) % n])) return [false, "edges " + (i + 1) + " and " + (j + 1) + " cross or touch"];
+    }
+  }
+  return [true, ""];
+}
+
+// ---------------------------------------------------------------- shared state
+const cv = document.getElementById("cv"), ctx = cv.getContext("2d");
+const ch = document.getElementById("charts"), cx2 = ch.getContext("2d");
+const msg = document.getElementById("msg");
+let A = null;                 // current args
+let mode = null;
+let dpr = window.devicePixelRatio || 1;
+function sizeCanvas(c, w, h) {
+  c.style.width = w + "px"; c.style.height = h + "px";
+  c.width = Math.round(w * dpr); c.height = Math.round(h * dpr);
+  c.getContext("2d").setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+function say(text, cls) { msg.className = cls || ""; msg.textContent = text || ""; }
+
+// world <-> pixel
+let view = { x0: -5, y0: -5, w: 210 }, S = 600;
+function px(p) { return [(p[0] - view.x0) / view.w * S, S - (p[1] - view.y0) / view.w * S]; }
+function world(x, y) { return [view.x0 + x / S * view.w, view.y0 + (S - y) / S * view.w]; }
+
+// ---------------------------------------------------------------- DRAW mode
+let pts = [], closed = false, hover = null, seq = 0, inited = false;
+
+function drawGrid() {
+  const ext = A.extent, step = ext >= 150 ? 10 : 5;
+  ctx.lineWidth = 1;
+  for (let v = 0; v <= ext + 1e-9; v += step) {
+    ctx.strokeStyle = (Math.round(v) % 50 === 0) ? "#dfe5ec" : "#f0f3f7";
+    let p = px([v, 0]), q = px([v, ext]);
+    ctx.beginPath(); ctx.moveTo(p[0], p[1]); ctx.lineTo(q[0], q[1]); ctx.stroke();
+    p = px([0, v]); q = px([ext, v]);
+    ctx.beginPath(); ctx.moveTo(p[0], p[1]); ctx.lineTo(q[0], q[1]); ctx.stroke();
+  }
+  ctx.fillStyle = "#8c96a3"; ctx.font = "11px sans-serif";
+  for (let v = 0; v <= ext + 1e-9; v += 50) {
+    const p = px([v, 0]); ctx.fillText(String(v), p[0] + 2, p[1] - 3);
+    if (v > 0) { const q = px([0, v]); ctx.fillText(String(v), q[0] + 2, q[1] - 3); }
+  }
+}
+
+function renderDraw() {
+  ctx.clearRect(0, 0, S, S);
+  drawGrid();
+  const poly = A.readonly ? (A.view_poly || []) : pts;
+  const isClosed = A.readonly ? true : closed;
+  if (poly.length) {
+    ctx.beginPath();
+    poly.forEach((p, i) => { const q = px(p); i ? ctx.lineTo(q[0], q[1]) : ctx.moveTo(q[0], q[1]); });
+    if (isClosed) { ctx.closePath(); ctx.fillStyle = "rgba(160,160,160,0.45)"; ctx.fill(); }
+    ctx.strokeStyle = "#1B2A41"; ctx.lineWidth = 2; ctx.stroke();
+    if (!A.readonly) {
+      poly.forEach((p, i) => {
+        const q = px(p); ctx.beginPath(); ctx.arc(q[0], q[1], i === 0 ? 5 : 3.5, 0, 2 * Math.PI);
+        ctx.fillStyle = i === 0 ? "#2E8B57" : "#1B2A41"; ctx.fill();
+      });
+    }
+  }
+  if (!A.readonly && !closed && hover) {
+    const q = px(hover);
+    let ok = true;
+    if (pts.length) {
+      ok = (pts.length >= 3 && same(hover, pts[0])) ? isSimple(pts)[0] : canAdd(pts, hover)[0];
+      const a = px(pts[pts.length - 1]);
+      ctx.setLineDash([6, 4]); ctx.strokeStyle = ok ? "#2E8B57" : "#C8102E"; ctx.lineWidth = 1.8;
+      ctx.beginPath(); ctx.moveTo(a[0], a[1]); ctx.lineTo(q[0], q[1]); ctx.stroke(); ctx.setLineDash([]);
+    }
+    ctx.beginPath(); ctx.arc(q[0], q[1], 4, 0, 2 * Math.PI);
+    ctx.strokeStyle = ok ? "#1F5FAD" : "#C8102E"; ctx.lineWidth = 2; ctx.stroke();
+    ctx.fillStyle = "#5F6B7A"; ctx.font = "12px sans-serif";
+    ctx.fillText("(" + hover[0] + ", " + hover[1] + ")", q[0] + 8, q[1] - 8);
+  }
+  document.getElementById("count").textContent = A.readonly ? "" :
+    (pts.length + " vertices" + (closed ? ", closed" : ""));
+  document.getElementById("bclose").disabled = A.readonly || closed || pts.length < 3;
+  document.getElementById("bundo").disabled = A.readonly || pts.length === 0;
+  document.getElementById("bclear").disabled = A.readonly || pts.length === 0;
+}
+
+function snapPt(e) {
+  const r = cv.getBoundingClientRect();
+  const w = world(e.clientX - r.left, e.clientY - r.top), s = A.snap;
+  let x = Math.round(w[0] / s) * s, y = Math.round(w[1] / s) * s;
+  x = Math.min(Math.max(x, 0), A.extent); y = Math.min(Math.max(y, 0), A.extent);
+  return [Number(x.toFixed(4)), Number(y.toFixed(4))];
+}
+function publish() { seq += 1; setValue({ pts: pts, closed: closed, seq: seq }); }
+function tryClose() {
+  const [ok, why] = isSimple(pts);
+  if (!ok) { say("Cannot close: " + why + ".", "err"); return; }
+  closed = true; hover = null; say("Polygon closed. Undo reopens it.", "ok"); renderDraw(); publish();
+}
+cv.addEventListener("mousemove", e => { if (mode !== "draw" || A.readonly || closed) return; hover = snapPt(e); renderDraw(); });
+cv.addEventListener("mouseleave", () => { if (mode !== "draw") return; hover = null; renderDraw(); });
+cv.addEventListener("click", e => {
+  if (mode !== "draw" || A.readonly) return;
+  if (closed) { say("The polygon is closed. Undo or Clear to edit it.", "muted"); return; }
+  const p = snapPt(e);
+  if (pts.length >= 3 && same(p, pts[0])) { tryClose(); return; }
+  const [ok, why] = canAdd(pts, p);
+  if (!ok) { say("Vertex rejected: " + why + ". The polygon must stay simple.", "err"); return; }
+  pts.push(p); say("", ""); renderDraw();
+});
+document.getElementById("bclose").onclick = () => tryClose();
+document.getElementById("bundo").onclick = () => {
+  if (closed) { closed = false; say("Polygon reopened.", "muted"); renderDraw(); publish(); return; }
+  pts.pop(); say("", ""); renderDraw();
+};
+document.getElementById("bclear").onclick = () => {
+  const wasClosed = closed; pts = []; closed = false; say("", ""); renderDraw();
+  if (wasClosed) publish();
+};
+
+// ---------------------------------------------------------------- SIM mode
+let sim = null, cur = 0, playing = true, acc = 0, lastT = null, raf = null, simKey = null;
+
+function curvatureFlags(Q, kmax) {
+  const m = Q.length / 2, bad = new Array(m);
+  let kbest = 0;
+  for (let i = 0; i < m; i++) {
+    const a = (i - 1 + m) % m, c = (i + 1) % m;
+    const ex = Q[2 * i] - Q[2 * a], ey = Q[2 * i + 1] - Q[2 * a + 1];
+    const fx = Q[2 * c] - Q[2 * i], fy = Q[2 * c + 1] - Q[2 * i + 1];
+    const th = Math.abs(Math.atan2(ex * fy - ey * fx, ex * fx + ey * fy));
+    const k = th / (0.5 * (Math.hypot(ex, ey) + Math.hypot(fx, fy)));
+    bad[i] = k > kmax * 1.01; if (k > kbest) kbest = k;
+  }
+  return [bad, kbest / kmax];
+}
+
+function fitView(sets) {
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const F of sets) for (let i = 0; i < F.length; i += 2) {
+    x0 = Math.min(x0, F[i]); x1 = Math.max(x1, F[i]); y0 = Math.min(y0, F[i + 1]); y1 = Math.max(y1, F[i + 1]);
+  }
+  const w = 1.12 * Math.max(x1 - x0, y1 - y0), cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
+  view = { x0: cx - w / 2, y0: cy - w / 2, w: w };
+}
+
+function pathFlat(F, close) {
+  ctx.beginPath();
+  for (let i = 0; i < F.length; i += 2) { const q = px([F[i], F[i + 1]]); i ? ctx.lineTo(q[0], q[1]) : ctx.moveTo(q[0], q[1]); }
+  if (close) ctx.closePath();
+}
+
+function renderSim() {
+  const s = sim, k = cur, Q = s.frames[k], D = s.disp ? s.disp[k] : null;
+  ctx.clearRect(0, 0, S, S);
+  pathFlat(s.poly, true); ctx.fillStyle = "#d9d9d9"; ctx.fill(); ctx.strokeStyle = "#808080"; ctx.lineWidth = 1; ctx.stroke();
+  pathFlat(Q, true); ctx.strokeStyle = "#262626"; ctx.lineWidth = 1.6; ctx.stroke();
+  // red dots and max curvature computed in Python on the exact coordinates
+  const m = Q.length / 2, kr = s.K[k], bad = new Array(m).fill(false);
+  for (const i of s.bad[k]) bad[i] = true;
+  ctx.fillStyle = "#262626";
+  for (let i = 0; i < m; i++) { const q = px([Q[2 * i], Q[2 * i + 1]]); ctx.fillRect(q[0] - 1.3, q[1] - 1.3, 2.6, 2.6); }
+  ctx.fillStyle = "crimson";
+  for (let i = 0; i < m; i++) if (bad[i]) { const q = px([Q[2 * i], Q[2 * i + 1]]); ctx.beginPath(); ctx.arc(q[0], q[1], 3.6, 0, 2 * Math.PI); ctx.fill(); }
+  let note = "";
+  if (D && D.length === Q.length) {
+    let mx = 0; for (let i = 0; i < m; i++) mx = Math.max(mx, Math.hypot(D[2 * i], D[2 * i + 1]));
+    if (mx > 1e-9) {
+      const sc = 0.10 * view.w / mx; let nout = 0, nin = 0;
+      for (let i = 0; i < m; i++) {
+        const dx = D[2 * i], dy = D[2 * i + 1]; if (Math.hypot(dx, dy) < 1e-9) continue;
+        const a = (i - 1 + m) % m, c = (i + 1) % m;
+        const nx = Q[2 * c + 1] - Q[2 * a + 1], ny = -(Q[2 * c] - Q[2 * a]);
+        const out = dx * nx + dy * ny >= 0; out ? nout++ : nin++;
+        const p = px([Q[2 * i], Q[2 * i + 1]]), q = px([Q[2 * i] + dx * sc, Q[2 * i + 1] + dy * sc]);
+        ctx.strokeStyle = ctx.fillStyle = out ? "#e67e22" : "#1f5fbf"; ctx.lineWidth = 1.4;
+        ctx.beginPath(); ctx.moveTo(p[0], p[1]); ctx.lineTo(q[0], q[1]); ctx.stroke();
+        const ang = Math.atan2(q[1] - p[1], q[0] - p[0]), h = 5;
+        ctx.beginPath(); ctx.moveTo(q[0], q[1]);
+        ctx.lineTo(q[0] - h * Math.cos(ang - 0.45), q[1] - h * Math.sin(ang - 0.45));
+        ctx.lineTo(q[0] - h * Math.cos(ang + 0.45), q[1] - h * Math.sin(ang + 0.45)); ctx.closePath(); ctx.fill();
+      }
+      note = "this step: " + nout + " outward, " + nin + " inward (arrows x" + sc.toFixed(0) + ")";
+    }
+  }
+  const last = k === s.frames.length - 1;
+  if (last && s.cert) { pathFlat(s.cert, true); ctx.strokeStyle = "#1F5FAD"; ctx.lineWidth = 2.6; ctx.stroke(); }
+  // header
+  ctx.fillStyle = "rgba(255,255,255,0.85)"; ctx.fillRect(0, 0, S, note ? 44 : 26);
+  ctx.fillStyle = "#1B2A41"; ctx.font = "bold 13px sans-serif";
+  ctx.fillText("iteration " + s.its[k] + "    L = " + s.L[k].toFixed(0) + "    max κ/κmax = " +
+               kr.toFixed(2) + "    vertices = " + m, 8, 18);
+  if (note) { ctx.font = "12px sans-serif"; ctx.fillStyle = "#5F6B7A"; ctx.fillText(note, 8, 36); }
+  if (last) {
+    ctx.font = "bold 14px sans-serif";
+    ctx.fillStyle = (s.status === "converged" || s.status === "no violations") ? "#2E8B57" :
+                    (s.status === "stopped" ? "#D06A12" : "#C8102E");
+    ctx.fillText(s.status.toUpperCase() + (s.cert ? "  (blue: certified curve)" : ""), 8, S - 10);
+  }
+  document.getElementById("slider").value = k;
+  renderCharts();
+}
+
+function renderCharts() {
+  const s = sim, W = S, H = 150, gap = 16, pw = (W - gap) / 2;
+  cx2.clearRect(0, 0, W, H);
+  const panels = [
+    { y: s.K, title: "max curvature κ/κmax (log)", log: true, ref: 1, col: "#262626" },
+    { y: s.V, title: "vertices violating the bound", log: false, ref: null, col: "crimson" }];
+  panels.forEach((P, j) => {
+    const x0 = j * (pw + gap), l = x0 + 34, r = x0 + pw - 6, t = 22, b = H - 20;
+    cx2.fillStyle = "#1B2A41"; cx2.font = "12px sans-serif"; cx2.fillText(P.title, x0 + 4, 14);
+    cx2.strokeStyle = "#d5dbe3"; cx2.lineWidth = 1; cx2.strokeRect(l, t, r - l, b - t);
+    const f = v => P.log ? Math.log10(Math.max(v, 1e-3)) : v;
+    let lo = Infinity, hi = -Infinity;
+    for (const v of P.y) { lo = Math.min(lo, f(v)); hi = Math.max(hi, f(v)); }
+    if (P.ref !== null) { lo = Math.min(lo, f(P.ref)); hi = Math.max(hi, f(P.ref)); }
+    if (!P.log) lo = 0;
+    if (hi - lo < 1e-9) hi = lo + 1;
+    const X = i => l + (r - l) * (s.its[i] / Math.max(1, s.its[s.its.length - 1]));
+    const Y = v => b - (b - t) * (f(v) - lo) / (hi - lo);
+    cx2.fillStyle = "#8c96a3"; cx2.font = "10px sans-serif";
+    cx2.fillText(P.log ? (Math.pow(10, hi)).toFixed(hi > 1.5 ? 0 : 1) : hi.toFixed(0), x0 + 2, t + 8);
+    cx2.fillText(P.log ? (Math.pow(10, lo)).toFixed(2) : "0", x0 + 2, b);
+    cx2.fillText("iteration " + s.its[s.its.length - 1], r - 80, H - 5);
+    if (P.ref !== null) {
+      cx2.setLineDash([5, 4]); cx2.strokeStyle = "crimson"; cx2.beginPath();
+      cx2.moveTo(l, Y(P.ref)); cx2.lineTo(r, Y(P.ref)); cx2.stroke(); cx2.setLineDash([]);
+    }
+    cx2.strokeStyle = P.col; cx2.lineWidth = 1.4; cx2.beginPath();
+    P.y.forEach((v, i) => { i ? cx2.lineTo(X(i), Y(v)) : cx2.moveTo(X(i), Y(v)); }); cx2.stroke();
+    cx2.strokeStyle = "crimson"; cx2.lineWidth = 1.2; cx2.beginPath();
+    cx2.moveTo(X(cur), t); cx2.lineTo(X(cur), b); cx2.stroke();
+    cx2.fillStyle = "crimson"; cx2.beginPath(); cx2.arc(X(cur), Y(P.y[cur]), 3.5, 0, 2 * Math.PI); cx2.fill();
+  });
+}
+
+function tick(t) {
+  if (!playing || mode !== "sim") { raf = null; return; }
+  if (lastT === null) lastT = t;
+  acc += (t - lastT) / 1000 * sim.fps * parseFloat(document.getElementById("speed").value);
+  lastT = t;
+  if (acc >= 1) {
+    const n = Math.floor(acc); acc -= n;
+    let k = cur + n;
+    if (k >= sim.frames.length - 1) {
+      if (document.getElementById("loop").checked) k = k % sim.frames.length;
+      else { k = sim.frames.length - 1; playing = false; document.getElementById("bplay").textContent = "Play"; }
+    }
+    cur = k; renderSim();
+  }
+  raf = requestAnimationFrame(tick);
+}
+function startPlay() {
+  if (cur >= sim.frames.length - 1) cur = 0;
+  playing = true; lastT = null; acc = 0; document.getElementById("bplay").textContent = "Pause";
+  if (!raf) raf = requestAnimationFrame(tick);
+}
+document.getElementById("bplay").onclick = () => {
+  if (playing) { playing = false; document.getElementById("bplay").textContent = "Play"; }
+  else startPlay();
+};
+document.getElementById("slider").oninput = e => {
+  playing = false; document.getElementById("bplay").textContent = "Play";
+  cur = parseInt(e.target.value); renderSim();
+};
+
+// ---------------------------------------------------------------- render entry point
+window.addEventListener("message", ev => {
+  const d = ev.data;
+  if (!d || d.type !== "streamlit:render") return;
+  A = d.args; mode = A.mode;
+  S = A.size || 600;
+  sizeCanvas(cv, S, S);
+  const isDraw = mode === "draw";
+  document.getElementById("drawbar").style.display = isDraw && !A.readonly ? "flex" : "none";
+  document.getElementById("simbar").style.display = isDraw ? "none" : "flex";
+  ch.style.display = isDraw ? "none" : "block";
+  cv.style.cursor = isDraw && !A.readonly ? "crosshair" : "default";
+  if (isDraw) {
+    view = { x0: -0.03 * A.extent, y0: -0.03 * A.extent, w: 1.06 * A.extent };
+    if (A.readonly && A.view_poly && A.view_poly.length) {
+      fitView([A.view_poly.flat()]);
+    }
+    if (!inited && !A.readonly) {          // the drawing lives here, not in Python
+      pts = (A.init_pts || []).map(p => [p[0], p[1]]); closed = !!A.init_closed; inited = true;
+      seq = A.init_seq || 0;
+    }
+    if (A.readonly) say("", "");
+    renderDraw();
+  } else {
+    if (simKey !== A.sim_key) {             // a new run: load it and play from the start
+      simKey = A.sim_key;
+      sim = A.sim; sim.fps = A.fps || 12;
+      sizeCanvas(ch, S, 150);
+      fitView([sim.poly].concat(sim.frames).concat(sim.cert ? [sim.cert] : []));
+      const sl = document.getElementById("slider"); sl.max = sim.frames.length - 1;
+      cur = 0; say(sim.frames.length + " frames (iterations " + sim.its[0] + "–" +
+                   sim.its[sim.its.length - 1] + ")", "muted");
+      renderSim(); startPlay();
+    } else { sizeCanvas(ch, S, 150); renderSim(); }
+  }
+  setHeight();
+});
+send("streamlit:componentReady", { apiVersion: 1 });
+</script>
+</body>
+</html>
